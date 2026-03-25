@@ -20,6 +20,13 @@ export default defineConfig(async () => ({
   server: {
     port: 1420,
     strictPort: true,
+    host: '0.0.0.0',
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:5000',
+        changeOrigin: true,
+      }
+    }
   },
 
   // Add the base and build configuration for Electron/Tauri

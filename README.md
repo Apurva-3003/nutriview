@@ -30,6 +30,7 @@
     <li><a href="#-getting-started">Getting Started</a>
       <ul>
         <li><a href="#-installation">Installation</a></li>
+        <li><a href="#-backend-admin-authentication-flask">Backend admin authentication (Flask)</a></li>
       </ul>
     </li>
     <li><a href="#%EF%B8%8F-common-issues">Common Issues</a></li>
@@ -142,6 +143,49 @@ Download the latest release from the [GitHub Releases Page](https://github.com/s
     Then move the extracted application to your **Applications** folder. Launch the application as usual.
 
 Launch the Application: The application connects the Vue 3 frontend with the Flask backend and should be ready to use.
+
+### Backend admin authentication (Flask)
+
+When you run the Flask backend directly (for example during development), it **requires** admin credentials from the environment. There are **no built-in default** admin username or password.
+
+Set these variables (for example in `backend/.env`, which is gitignored):
+
+| Variable | Description |
+|----------|-------------|
+| `ADMIN_USERNAME` | Plain-text admin login name |
+| `ADMIN_PASSWORD_HASH` | Bcrypt hash of the admin password (not the plain password) |
+
+The login API compares submitted passwords with `bcrypt.checkpw` against `ADMIN_PASSWORD_HASH`.
+
+**Create credentials with the helper script (recommended)**
+
+1. Open a terminal in the `backend` directory.
+2. Run:
+
+   ```bash
+   python create_admin.py
+   ```
+
+3. Enter a username and password when prompted. The script hashes the password with bcrypt and writes or updates `ADMIN_USERNAME` and `ADMIN_PASSWORD_HASH` in `backend/.env`.
+
+**Generate a bcrypt hash manually**
+
+If you prefer not to use the script, you can generate a hash in Python (from `backend` with dependencies installed):
+
+```bash
+python -c "import bcrypt; print(bcrypt.hashpw(input('Password: ').encode('utf-8'), bcrypt.gensalt()).decode('ascii'))"
+```
+
+Then set in `backend/.env` (use quotes around the hash because it contains `$`):
+
+```env
+ADMIN_USERNAME="your-username"
+ADMIN_PASSWORD_HASH="$2b$12$..."
+```
+
+You can also export the variables in your shell instead of using `.env`.
+
+If `ADMIN_USERNAME` or `ADMIN_PASSWORD_HASH` is missing when the app starts, the backend logs an error and exits; follow the message or this section to configure credentials.
 
 ## Common Issues
 

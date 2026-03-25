@@ -8,4 +8,4 @@ dist
 .github
 apppy
 build
-**/target
+**/targetbackend/.env

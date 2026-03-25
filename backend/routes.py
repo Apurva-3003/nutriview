@@ -1,6 +1,7 @@
 from flask import jsonify, request, send_file
 import mimetypes
 from werkzeug.utils import safe_join
+import logging
 import os
 import sys
 from flask_jwt_extended import (
@@ -42,15 +43,26 @@ from validate import (
 )
 import json
 
-# Load environment variables
-load_dotenv()
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(_BACKEND_DIR, ".env")
 
-# In the Tauri EXE sidecar, HTTPS is not required and we can use default credentials.
-# When running as a web app, HTTPS is required and proper environment variables should be set for security.
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "default")
-ADMIN_PASSWORD = os.getenv(
-    "ADMIN_PASSWORD", bcrypt.hashpw("default".encode(), bcrypt.gensalt()).decode()
-)
+# Load .env only when admin vars are not already set (e.g. Docker provides them)
+if not (os.getenv("ADMIN_USERNAME") and os.getenv("ADMIN_PASSWORD_HASH")):
+    load_dotenv(_ENV_PATH)
+
+ADMIN_USERNAME = (os.getenv("ADMIN_USERNAME") or "").strip().strip('"').strip("'")
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "").strip().strip('"').strip("'")
+
+if not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
+    logging.warning(
+        "ADMIN_USERNAME and/or ADMIN_PASSWORD_HASH missing; using development "
+        'fallback (username "apurva", password "test123").'
+    )
+    ADMIN_USERNAME = "apurva"
+    ADMIN_PASSWORD_HASH = bcrypt.hashpw(
+        b"test123", bcrypt.gensalt()
+    ).decode("utf-8")
+
 JWT_SECRET_KEY = secrets.token_hex(256)
 
 # Store revoked tokens
@@ -94,6 +106,9 @@ GUEST_PASSWORD = os.getenv(
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 def register_routes(app, cache):
     app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 3600  # 1 hour
@@ -131,28 +146,61 @@ def register_routes(app, cache):
         """
         Authenticate user using hashed password.
         """
-        data = request.get_json()
-        username = data.get("username")
-        password = data.get("password")
+        try:
+            data = request.get_json(silent=True) or {}
+            username = data.get("username")
+            password = data.get("password")
 
-        if not username or not password:
-            return jsonify({"error": "Missing username or password"}), 400
+            if not username or not password:
+                return jsonify({"error": "Missing username or password"}), 400
 
-        if username == ADMIN_USERNAME and bcrypt.checkpw(
-            password.encode(), ADMIN_PASSWORD.encode()
-        ):
-            role = "admin"
-        elif username == GUEST_USERNAME and bcrypt.checkpw(
-            password.encode(), GUEST_PASSWORD.encode()
-        ):
-            role = "guest"
-        else:
+            logger.debug("login: received username=%r", username)
+
+            admin_ok = None
+            guest_ok = None
+            if username == ADMIN_USERNAME:
+                try:
+                    admin_ok = bcrypt.checkpw(
+                        password.encode("utf-8"),
+                        ADMIN_PASSWORD_HASH.encode("utf-8"),
+                    )
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        "login: admin bcrypt error for username=%r: %s", username, e
+                    )
+                    admin_ok = False
+                logger.debug("login: admin bcrypt check succeeded=%s", admin_ok)
+            elif username == GUEST_USERNAME:
+                try:
+                    guest_ok = bcrypt.checkpw(
+                        password.encode("utf-8"), GUEST_PASSWORD.encode("utf-8")
+                    )
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        "login: guest bcrypt error for username=%r: %s", username, e
+                    )
+                    guest_ok = False
+
+            if admin_ok is True:
+                role = "admin"
+            elif guest_ok is True:
+                role = "guest"
+            else:
+                logger.warning(
+                    "login: authentication failed username=%r admin_bcrypt_ok=%s guest_bcrypt_ok=%s",
+                    username,
+                    admin_ok,
+                    guest_ok,
+                )
+                return jsonify({"error": "Invalid credentials"}), 401
+
+            access_token = create_access_token(
+                identity=username, additional_claims={"role": role}
+            )
+            return jsonify(access_token=access_token)
+        except Exception:
+            logger.exception("login: unexpected error")
             return jsonify({"error": "Invalid credentials"}), 401
-
-        access_token = create_access_token(
-            identity=username, additional_claims={"role": role}
-        )
-        return jsonify(access_token=access_token)
 
     @app.route("/api/logout", methods=["POST"])
     @jwt_required()

@@ -1,20 +1,23 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
 from flask import Flask
 from flask_cors import CORS
 from flask_caching import Cache
-from routes import register_routes
-from error_handlers import register_error_handlers
-from dotenv import load_dotenv
 import os
 import shutil
+
+# Load backend/.env before importing routes (routes validates admin env vars at import time)
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from routes import register_routes
+from error_handlers import register_error_handlers
 from config import Config
 
 if os.path.exists(Config.TEMPDIR):
     shutil.rmtree(Config.TEMPDIR)
 
 os.makedirs(Config.TEMPDIR, exist_ok=True)
-
-# Load environment variables
-load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -33,4 +36,4 @@ if __name__ == "__main__":
         os.environ["WAITRESS"] = "1"
         serve(app, host="0.0.0.0", port=5000)
     else:
-        app.run()
+        app.run(host="0.0.0.0", port=5000)

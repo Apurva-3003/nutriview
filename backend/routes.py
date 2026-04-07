@@ -46,22 +46,22 @@ import json
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATH = os.path.join(_BACKEND_DIR, ".env")
 
-# Load .env only when admin vars are not already set (e.g. Docker provides them)
-if not (os.getenv("ADMIN_USERNAME") and os.getenv("ADMIN_PASSWORD_HASH")):
-    load_dotenv(_ENV_PATH)
+# Merge backend/.env (override=False: explicit env vars e.g. from Docker win over the file).
+load_dotenv(_ENV_PATH)
 
 ADMIN_USERNAME = (os.getenv("ADMIN_USERNAME") or "").strip().strip('"').strip("'")
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "").strip().strip('"').strip("'")
 
-if not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
-    logging.warning(
-        "ADMIN_USERNAME and/or ADMIN_PASSWORD_HASH missing; using development "
-        'fallback (username "apurva", password "test123").'
+if not ADMIN_USERNAME:
+    raise RuntimeError(
+        "ADMIN_USERNAME is not set. Set it as an environment variable or in the .env file. "
+        "Do not use hardcoded credentials."
     )
-    ADMIN_USERNAME = "apurva"
-    ADMIN_PASSWORD_HASH = bcrypt.hashpw(
-        b"test123", bcrypt.gensalt()
-    ).decode("utf-8")
+if not ADMIN_PASSWORD_HASH:
+    raise RuntimeError(
+        "ADMIN_PASSWORD_HASH is not set. Set it as an environment variable or in the .env file. "
+        "Do not use hardcoded credentials."
+    )
 
 JWT_SECRET_KEY = secrets.token_hex(256)
 
@@ -100,10 +100,19 @@ PERMISSION_REQUIRED = {
 }
 
 # Guest credentials
-GUEST_USERNAME = os.getenv("GUEST_USERNAME", "guest")
-GUEST_PASSWORD = os.getenv(
-    "GUEST_PASSWORD", bcrypt.hashpw("guest".encode(), bcrypt.gensalt()).decode()
-)
+GUEST_USERNAME = (os.getenv("GUEST_USERNAME") or "").strip().strip('"').strip("'")
+GUEST_PASSWORD = (os.getenv("GUEST_PASSWORD") or "").strip().strip('"').strip("'")
+
+if not GUEST_USERNAME:
+    raise RuntimeError(
+        "GUEST_USERNAME is not set. Set it as an environment variable or in the .env file. "
+        "Do not use hardcoded credentials."
+    )
+if not GUEST_PASSWORD:
+    raise RuntimeError(
+        "GUEST_PASSWORD is not set. Set it as an environment variable or in the .env file. "
+        "Do not use hardcoded credentials."
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -148,17 +157,20 @@ def register_routes(app, cache):
         """
         try:
             data = request.get_json(silent=True) or {}
-            username = data.get("username")
+            username_in = (data.get("username") or "").strip()
             password = data.get("password")
 
-            if not username or not password:
+            if not username_in or not password:
                 return jsonify({"error": "Missing username or password"}), 400
 
-            logger.debug("login: received username=%r", username)
+            logger.debug("login: received username=%r", username_in)
 
+            # Case-insensitive username match (env / Docker may differ in casing from the UI).
+            ufold = username_in.casefold()
             admin_ok = None
             guest_ok = None
-            if username == ADMIN_USERNAME:
+            identity = None
+            if ufold == ADMIN_USERNAME.casefold():
                 try:
                     admin_ok = bcrypt.checkpw(
                         password.encode("utf-8"),
@@ -166,20 +178,24 @@ def register_routes(app, cache):
                     )
                 except (ValueError, TypeError) as e:
                     logger.warning(
-                        "login: admin bcrypt error for username=%r: %s", username, e
+                        "login: admin bcrypt error for username=%r: %s", username_in, e
                     )
                     admin_ok = False
                 logger.debug("login: admin bcrypt check succeeded=%s", admin_ok)
-            elif username == GUEST_USERNAME:
+                if admin_ok is True:
+                    identity = ADMIN_USERNAME
+            elif ufold == GUEST_USERNAME.casefold():
                 try:
                     guest_ok = bcrypt.checkpw(
                         password.encode("utf-8"), GUEST_PASSWORD.encode("utf-8")
                     )
                 except (ValueError, TypeError) as e:
                     logger.warning(
-                        "login: guest bcrypt error for username=%r: %s", username, e
+                        "login: guest bcrypt error for username=%r: %s", username_in, e
                     )
                     guest_ok = False
+                if guest_ok is True:
+                    identity = GUEST_USERNAME
 
             if admin_ok is True:
                 role = "admin"
@@ -188,14 +204,14 @@ def register_routes(app, cache):
             else:
                 logger.warning(
                     "login: authentication failed username=%r admin_bcrypt_ok=%s guest_bcrypt_ok=%s",
-                    username,
+                    username_in,
                     admin_ok,
                     guest_ok,
                 )
                 return jsonify({"error": "Invalid credentials"}), 401
 
             access_token = create_access_token(
-                identity=username, additional_claims={"role": role}
+                identity=identity, additional_claims={"role": role}
             )
             return jsonify(access_token=access_token)
         except Exception:

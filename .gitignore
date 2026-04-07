@@ -29,3 +29,4 @@ _internal
 *.njsproj
 *.sln
 *.sw?
+backend/venv/

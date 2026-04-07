@@ -146,16 +146,18 @@ Launch the Application: The application connects the Vue 3 frontend with the Fla
 
 ### Backend admin authentication (Flask)
 
-When you run the Flask backend directly (for example during development), it **requires** admin credentials from the environment. There are **no built-in default** admin username or password.
+The backend reads credentials from the environment. On startup, `apppy.py` loads variables from **`backend/.env`** (gitignored) via `python-dotenv` before the rest of the app imports. If `ADMIN_USERNAME` and `ADMIN_PASSWORD_HASH` are still not set after that (for example in tests that import `routes` alone), `routes.py` loads the same file again.
 
-Set these variables (for example in `backend/.env`, which is gitignored):
+**Required:** If any of the variables below are missing, the process **exits at import time** with a `RuntimeError`—there are no default usernames or passwords.
 
 | Variable | Description |
 |----------|-------------|
-| `ADMIN_USERNAME` | Plain-text admin login name |
-| `ADMIN_PASSWORD_HASH` | Bcrypt hash of the admin password (not the plain password) |
+| `ADMIN_USERNAME` | Admin login name (plain text) |
+| `ADMIN_PASSWORD_HASH` | Bcrypt hash of the admin password (never store the plain password here) |
+| `GUEST_USERNAME` | Guest login name (plain text) |
+| `GUEST_PASSWORD` | Bcrypt hash of the guest password (same format as `ADMIN_PASSWORD_HASH`) |
 
-The login API compares submitted passwords with `bcrypt.checkpw` against `ADMIN_PASSWORD_HASH`.
+The login API verifies passwords with `bcrypt.checkpw` against the stored hashes.
 
 **Create credentials with the helper script (recommended)**
 
@@ -176,16 +178,26 @@ If you prefer not to use the script, you can generate a hash in Python (from `ba
 python -c "import bcrypt; print(bcrypt.hashpw(input('Password: ').encode('utf-8'), bcrypt.gensalt()).decode('ascii'))"
 ```
 
-Then set in `backend/.env` (use quotes around the hash because it contains `$`):
+Then set in `backend/.env` (use quotes around hashes because they contain `$`). Generate a separate bcrypt hash for the guest account and include all four variables:
 
 ```env
 ADMIN_USERNAME="your-username"
 ADMIN_PASSWORD_HASH="$2b$12$..."
+GUEST_USERNAME="guest"
+GUEST_PASSWORD="$2b$12$..."
 ```
 
-You can also export the variables in your shell instead of using `.env`.
+You can also export the variables in your shell instead of using `backend/.env`.
 
-If `ADMIN_USERNAME` or `ADMIN_PASSWORD_HASH` is missing when the app starts, the backend logs an error and exits; follow the message or this section to configure credentials.
+**Docker**
+
+Use the same `backend/.env` as local development. From the repository root:
+
+```bash
+docker run -p 0.0.0.0:5000:5000 --env-file backend/.env nutriview
+```
+
+`--env-file` injects variables into the container process. The Flask app does not read any other env file name (there is no separate root-level `backend.env`); `load_dotenv` only loads `backend/.env` when variables are not already set.
 
 ## Common Issues
 

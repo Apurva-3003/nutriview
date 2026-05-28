@@ -56,10 +56,13 @@ async fn start_server() {
 async fn shutdown_flask() {
     let client = Client::new();
     // Send a shutdown request to the Flask server when Tauri closes
-    if let Err(_err) = client.get("http://127.0.0.1:5000/api/shutdown").send().await {
-        println!("Flask server shutdown request success.");
-    } else {
-        println!("Flask server shutdown request failed.");
+    match client
+        .post("http://127.0.0.1:5000/api/shutdown")
+        .send()
+        .await
+    {
+        Ok(_) => println!("Flask server shutdown request succeeded."),
+        Err(err) => println!("Flask server shutdown request failed: {err}"),
     }
 }
 

@@ -156,19 +156,23 @@ The backend reads credentials from the environment. On startup, `apppy.py` loads
 | `ADMIN_PASSWORD_HASH` | Bcrypt hash of the admin password (never store the plain password here) |
 | `GUEST_USERNAME` | Guest login name (plain text) |
 | `GUEST_PASSWORD` | Bcrypt hash of the guest password (same format as `ADMIN_PASSWORD_HASH`) |
+| `JWT_SECRET_KEY` | Secret used to sign JWT session tokens (required when `PRODUCTION=True`) |
 
 The login API verifies passwords with `bcrypt.checkpw` against the stored hashes.
 
-**Create credentials with the helper script (recommended)**
+Copy `backend/.env.example` to `backend/.env` before first run, or use the helper scripts below.
+
+**Create credentials with the helper scripts (recommended)**
 
 1. Open a terminal in the `backend` directory.
 2. Run:
 
    ```bash
    python create_admin.py
+   python create_guest.py
    ```
 
-3. Enter a username and password when prompted. The script hashes the password with bcrypt and writes or updates `ADMIN_USERNAME` and `ADMIN_PASSWORD_HASH` in `backend/.env`.
+3. Enter usernames and passwords when prompted. Passwords are hashed with bcrypt and written to `backend/.env`. `create_admin.py` also generates `JWT_SECRET_KEY` if it is not already set.
 
 **Generate a bcrypt hash manually**
 
@@ -185,6 +189,7 @@ ADMIN_USERNAME="your-username"
 ADMIN_PASSWORD_HASH="$2b$12$..."
 GUEST_USERNAME="guest"
 GUEST_PASSWORD="$2b$12$..."
+JWT_SECRET_KEY="64-character-hex-from-secrets-token-hex-32"
 ```
 
 You can also export the variables in your shell instead of using `backend/.env`.

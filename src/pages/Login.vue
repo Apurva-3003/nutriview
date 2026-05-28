@@ -8,7 +8,7 @@
             <div class="panel-body">
                 <fieldset>
                     <legend class="panel-title">Sign in to NutriView</legend>
-                    <form @submit.prevent="login(false)">
+                    <form @submit.prevent="login">
                         <div class="formGroup">
                             <label for="username"><b>Email address/Username:</b></label>
                             <input id="username" type="text" v-model="username" class="formControl" maxlength="50"
@@ -38,7 +38,8 @@
                                 </span>
                             </div>
                         </div>
-                        <HCaptcha :sitekey="sitekey" :reCaptchaCompat="false" @verify="onHCaptchaChange" />
+                        <HCaptcha v-if="!isDesktop" :sitekey="sitekey" :reCaptchaCompat="false"
+                            @verify="onHCaptchaChange" />
                         <button type="submit" class="loginButton">Sign in</button>
                         <button type="button" class="contactAdminButton" @click="showContactForm = true">Contact
                             Admin</button>
@@ -117,6 +118,11 @@ export default {
     props: {
         isAuthenticated: Boolean
     },
+    computed: {
+        isDesktop() {
+            return typeof window !== 'undefined' && !!window.__TAURI__;
+        },
+    },
     components: {
         HCaptcha
     },
@@ -124,18 +130,17 @@ export default {
         togglePasswordVisibility() {
             this.showPassword = !this.showPassword;
         },
-        async login(autoLogin) {
+        async login() {
             try {
-                const credentials = autoLogin
-                    ? { username: 'default', password: 'default' }
-                    : { username: this.username, password: this.password };
-
-                if (!autoLogin && !this.captchaToken) {
+                if (!this.isDesktop && !this.captchaToken) {
                     this.error = 'Please complete the CAPTCHA';
                     return;
                 }
 
-                const response = await axios.post(`${import.meta.env.VITE_API_BASE_URL}/api/login`, credentials);
+                const response = await axios.post(`${import.meta.env.VITE_API_BASE_URL}/api/login`, {
+                    username: this.username,
+                    password: this.password,
+                });
                 const token = response.data.access_token;
                 localStorage.setItem('token', token);
                 this.$emit("update:isAuthenticated", true);
@@ -148,12 +153,6 @@ export default {
             this.captchaToken = captchaToken;
         },
     },
-    mounted() {
-        // Auto login in Tauri
-        if (window.__TAURI__) {
-            this.login(true);
-        }
-    }
 };
 </script>
 

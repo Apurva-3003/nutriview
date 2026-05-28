@@ -485,9 +485,9 @@
             <h2>Desktop App vs. Web App</h2>
             <p>While both versions offer the same core functionality, there are key differences:</p>
             <ul>
-                <li><strong>Authentication:</strong> The Web App requires login with an email and password. The
-                    Desktop
-                    App does not require login.</li>
+                <li><strong>Authentication:</strong> Both the Web App and Desktop App require login with the
+                    username and password configured for your deployment (see the project README). The Web App
+                    also requires CAPTCHA; the Desktop App does not.</li>
                 <li><strong>Folder Access:</strong>
                     <ul>
                         <li><strong>Desktop App:</strong> You select folders directly from your local filesystem.

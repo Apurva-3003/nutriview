@@ -2,29 +2,34 @@
 Interactive helper: prompts for admin username and password, hashes the password with bcrypt,
 and writes ADMIN_USERNAME and ADMIN_PASSWORD_HASH to backend/.env.
 
+Optionally generates JWT_SECRET_KEY if it is not already set.
+
 Run from the backend directory: python create_admin.py
 """
 
 from __future__ import annotations
 
 import getpass
-import re
+import secrets
 import sys
 from pathlib import Path
 
 import bcrypt
 
+from credential_utils import read_env_lines, strip_env_keys, write_env_lines
 
-def _strip_existing_admin_lines(lines: list[str]) -> list[str]:
-    out: list[str] = []
-    for line in lines:
+_ADMIN_KEYS = frozenset({"ADMIN_USERNAME", "ADMIN_PASSWORD_HASH"})
+_JWT_KEY = "JWT_SECRET_KEY"
+
+
+def _jwt_already_set(env_path: Path) -> bool:
+    for line in read_env_lines(env_path):
         stripped = line.strip()
-        if re.match(r"^ADMIN_USERNAME\s*=", stripped):
-            continue
-        if re.match(r"^ADMIN_PASSWORD_HASH\s*=", stripped):
-            continue
-        out.append(line.rstrip("\n"))
-    return out
+        if stripped.startswith(f"{_JWT_KEY}="):
+            value = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+            if value:
+                return True
+    return False
 
 
 def main() -> int:
@@ -50,20 +55,21 @@ def main() -> int:
         "ascii"
     )
 
-    raw_lines: list[str] = []
-    if env_path.exists():
-        raw_lines = env_path.read_text(encoding="utf-8").splitlines()
-
-    kept = _strip_existing_admin_lines(raw_lines)
-    # Quote hash so characters like $ are not misinterpreted by dotenv parsers
-    new_block = [
+    kept = strip_env_keys(read_env_lines(env_path), _ADMIN_KEYS)
+    new_entries = [
         f'ADMIN_USERNAME="{username}"',
         f'ADMIN_PASSWORD_HASH="{password_hash}"',
     ]
-    body = "\n".join(kept + new_block) + "\n"
-    env_path.write_text(body, encoding="utf-8")
+
+    if not _jwt_already_set(env_path):
+        jwt_secret = secrets.token_hex(32)
+        new_entries.append(f'JWT_SECRET_KEY="{jwt_secret}"')
+        print("Generated JWT_SECRET_KEY (add to production deployments).")
+
+    write_env_lines(env_path, kept, new_entries)
 
     print(f"Wrote {env_path}")
+    print("Run python create_guest.py to set guest credentials if needed.")
     print("Restart the Flask app if it is already running.")
     return 0
 

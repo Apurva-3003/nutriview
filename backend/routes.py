@@ -14,8 +14,8 @@ from flask_jwt_extended import (
 )
 from functools import wraps
 from dotenv import load_dotenv
-import secrets
 import bcrypt
+from auth_config import resolve_jwt_secret_key
 from config import Config
 from services import (
     fetch_data_service,
@@ -70,7 +70,7 @@ if not ADMIN_PASSWORD_HASH:
         "Do not use hardcoded credentials."
     )
 
-JWT_SECRET_KEY = secrets.token_hex(256)
+JWT_SECRET_KEY = resolve_jwt_secret_key()
 
 # Store revoked tokens
 revoked_tokens = set()
@@ -557,15 +557,23 @@ def register_routes(app, cache):
     def health():
         return "Server is running...", 200
 
-    @app.route("/api/shutdown", methods=["GET"])
-    @jwt_required()
+    def _shutdown_is_loopback() -> bool:
+        """Allow embedded desktop server shutdown only from localhost."""
+        addr = request.remote_addr
+        if addr in ("127.0.0.1", "::1"):
+            return True
+        host = (request.host or "").split(":")[0]
+        return addr is None and host in ("127.0.0.1", "localhost", "::1")
+
+    @app.route("/api/shutdown", methods=["GET", "POST"])
     def shutdown():
-        # Shutdown the server if running as a standalone executable
-        if getattr(sys, "frozen", False):
-            shutdown_server()
-            return "Server shutting down...", 200
-        else:
+        # PyInstaller/Tauri sidecar: stop Flask without JWT (local process only).
+        if not getattr(sys, "frozen", False):
             return "Server is not running as a standalone executable.", 200
+        if not _shutdown_is_loopback():
+            return jsonify({"error": "Forbidden"}), 403
+        shutdown_server()
+        return "Server shutting down...", 200
 
     @app.route("/api/clear_cache", methods=["GET"])
     @jwt_required()

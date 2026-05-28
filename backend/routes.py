@@ -40,7 +40,14 @@ from validate import (
     validate_export_map_args,
     validate_serve_tif_args,
     validate_convert_excels_to_db_args,
+    validate_guest_permissions_payload,
+    validate_login_payload,
+    validate_upload_folder_files,
+    validate_convert_to_gpkg_files,
+    validate_convert_excel_files,
+    validate_geotiff_path_param,
 )
+from security_validation import normalized_upload_relative_path, path_is_under
 import json
 
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -157,11 +164,11 @@ def register_routes(app, cache):
         """
         try:
             data = request.get_json(silent=True) or {}
-            username_in = (data.get("username") or "").strip()
-            password = data.get("password")
-
-            if not username_in or not password:
+            creds = validate_login_payload(data)
+            if creds.get("error"):
                 return jsonify({"error": "Missing username or password"}), 400
+            username_in = creds["username"]
+            password = creds["password"]
 
             logger.debug("login: received username=%r", username_in)
 
@@ -255,6 +262,9 @@ def register_routes(app, cache):
             return jsonify(GUEST_PERMISSIONS)
 
         new_perms = request.get_json()
+        perm_check = validate_guest_permissions_payload(new_perms)
+        if perm_check.get("error"):
+            return jsonify(perm_check), 400
         for perm in ["read", "write", "upload", "download"]:
             if perm in new_perms and isinstance(new_perms[perm], bool):
                 GUEST_PERMISSIONS[perm] = new_perms[perm]
@@ -274,46 +284,19 @@ def register_routes(app, cache):
         """
         Endpoint to upload a folder with files to the server.
         """
-        # The form data sent from the frontend
-        files = request.files.getlist("files")  # This retrieves all files
+        files = request.files.getlist("files")
+        upload_check = validate_upload_folder_files(files)
+        if upload_check.get("error"):
+            return jsonify({"error": upload_check["error"]}), 400
 
-        if not files:
-            return jsonify({"error": "No files uploaded"})
-
-        def allowed_file(filename):
-            """
-            Check if the file is allowed based on its extension.
-            """
-            ALLOWED_EXTENSIONS = {
-                "shp",
-                "tif",
-                "gpkg",
-                "shx",
-                "dbf",
-                "cpg",
-                "prj",
-                "sbn",
-                "sbx",
-                "db3",
-                "tiff",
-                "xml",
-            }
-            return (
-                "." in filename
-                and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-            )
-
-        # Validate the uploaded files
         for file in files:
-            if not allowed_file(file.filename):
-                return (
-                    jsonify({"error": f"File type not allowed: {file.filename}"}),
-                    400,
-                )
-
-        # Loop through each file and save it in the corresponding folder
-        for file in files:
-            file_path = safe_join(Config.PATHFILE, file.filename)
+            raw = file.filename or ""
+            rel = normalized_upload_relative_path(raw)
+            if rel is None:
+                return jsonify({"error": "Invalid file name."}), 400
+            file_path = safe_join(Config.PATHFILE, rel)
+            if file_path is None or not path_is_under(Config.PATHFILE, file_path):
+                return jsonify({"error": "Invalid file path."}), 400
 
             # Ensure the file is not already there checking for duplicates
             if (
@@ -342,7 +325,7 @@ def register_routes(app, cache):
         # Validate the request arguments
         validation_response = validate_get_data_args(data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         response = fetch_data_service(data)
 
@@ -353,10 +336,15 @@ def register_routes(app, cache):
     @require_permission("download")
     # This endpoint is not cached because the file is generated dynamically
     def export_data():
-        data = request.args if request.method == "GET" else request.json
+        if request.method == "GET":
+            data = request.args
+        else:
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({"error": "Request validation failed."}), 400
         validation_response = validate_export_data_args(data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         if request.method == "POST":
             if data.get("date_type", None):
@@ -393,7 +381,7 @@ def register_routes(app, cache):
         # Validate the request arguments
         validation_response = validate_get_tables_args(data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         # Fetch the table names from the database
         tables = get_table_names(data)
@@ -412,7 +400,7 @@ def register_routes(app, cache):
         # Validate the request arguments
         validation_response = validate_list_files_args(data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         files_and_folders = get_files_and_folders(data)
 
@@ -433,7 +421,7 @@ def register_routes(app, cache):
         # Validate the request arguments
         validation_response = validate_get_table_details_args(data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         columns_and_time_range_dict = get_multi_columns_and_time_range(data)
 
@@ -452,7 +440,7 @@ def register_routes(app, cache):
         # Validate the request arguments
         validation_response = validate_geospatial_args(data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         geo_data = process_geospatial_data(data)
 
@@ -465,19 +453,20 @@ def register_routes(app, cache):
         """
         Serve the TIF file from the specified path.
         """
-        # Ensure the file has a .tif or .tiff extension
-        if not (filename.lower().endswith((".tif", ".tiff", ".png"))):
-            return jsonify({"error": "Only .tif or .tiff files are allowed"})
+        path_check = validate_geotiff_path_param(filename)
+        if path_check.get("error"):
+            return jsonify(path_check), 400
 
-        # Ensure the file is in the TEMP directory
-        filename = safe_join(Config.TEMPDIR, filename)
+        resolved = safe_join(Config.TEMPDIR, filename)
+        if resolved is None or not path_is_under(Config.TEMPDIR, resolved):
+            return jsonify({"error": "Invalid file path."}), 400
 
         # Validate the file path
-        validation_response = validate_serve_tif_args(filename)
+        validation_response = validate_serve_tif_args(resolved)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
-        return send_file(filename, mimetype="image/png", as_attachment=True)
+        return send_file(resolved, mimetype="image/png", as_attachment=True)
 
     @app.route("/api/get_geojson_colors", methods=["GET"])
     @jwt_required()
@@ -492,7 +481,7 @@ def register_routes(app, cache):
         # Validate the request arguments
         validation_response = validate_get_data_args(data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         colors = fetch_geojson_colors(data)
 
@@ -511,7 +500,7 @@ def register_routes(app, cache):
         # Validate the request arguments
         validation_response = validate_export_map_args(image, form_data)
         if validation_response.get("error", None):
-            return jsonify(validation_response)
+            return jsonify(validation_response), 400
 
         file_path = export_map_service(image, form_data)
 
@@ -534,12 +523,13 @@ def register_routes(app, cache):
         excel_files = request.files.getlist("files")
         data = request.form.to_dict()
 
-        if not excel_files:
-            return jsonify({"error": "Files and mapping data required"})
+        file_check = validate_convert_excel_files(excel_files)
+        if file_check.get("error"):
+            return jsonify({"error": file_check["error"]}), 400
 
-        validatetion_response = validate_convert_excels_to_db_args(data)
-        if validatetion_response.get("error", None):
-            return jsonify(validatetion_response)
+        validation_response = validate_convert_excels_to_db_args(data)
+        if validation_response.get("error", None):
+            return jsonify(validation_response), 400
 
         result = convert_excels_to_db_service(excel_files, data)
 
@@ -554,9 +544,9 @@ def register_routes(app, cache):
         API endpoint to convert uploaded files to GPKG format.
         """
         uploaded_files = request.files.getlist("files")
-
-        if not uploaded_files:
-            return jsonify({"error": "No files uploaded"})
+        gpkg_check = validate_convert_to_gpkg_files(uploaded_files)
+        if gpkg_check.get("error"):
+            return jsonify({"error": gpkg_check["error"]}), 400
 
         converted_files = convert_to_gpkg_service(uploaded_files)
 
@@ -568,6 +558,7 @@ def register_routes(app, cache):
         return "Server is running...", 200
 
     @app.route("/api/shutdown", methods=["GET"])
+    @jwt_required()
     def shutdown():
         # Shutdown the server if running as a standalone executable
         if getattr(sys, "frozen", False):
@@ -577,6 +568,7 @@ def register_routes(app, cache):
             return "Server is not running as a standalone executable.", 200
 
     @app.route("/api/clear_cache", methods=["GET"])
+    @jwt_required()
     def clear_cache_route():
         clear_cache(cache)
         return "Cache cleared.", 200

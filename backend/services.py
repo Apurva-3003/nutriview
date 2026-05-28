@@ -1,4 +1,5 @@
 import sqlite3
+import logging
 import os
 import pandas as pd
 import numpy as np
@@ -24,8 +25,48 @@ import pyogrio
 from osgeo import ogr, osr, gdal
 from zipfile import ZipFile, ZIP_DEFLATED
 from werkzeug.utils import safe_join
+from werkzeug.utils import secure_filename
 import re
 import numexpr as ne
+
+# Only allow digits/space/operators/parentheses/decimal points/commas plus
+# ASCII identifier tokens (validated separately against allowlisted functions + local_dict).
+_MEXPR_ALLOWED_CHARS = re.compile(r"^[0-9A-Za-z_\\s+\\-*/^().,]*$")
+_MEXPR_TOKEN = re.compile(r"\\b[A-Za-z_][A-Za-z0-9_]*\\b")
+_MEXPR_ALLOWED_FUNCS = frozenset({"sin", "cos", "log", "exp", "sqrt", "abs"})
+
+
+def _numexpr_is_safe(expr: str, local_dict: dict) -> bool:
+    if not isinstance(expr, str):
+        return False
+    s = expr.strip()
+    if not s:
+        return False
+    if not _MEXPR_ALLOWED_CHARS.fullmatch(s):
+        return False
+    # Reject anything alphabetic that isn't an allowed function or a provided variable.
+    for tok in _MEXPR_TOKEN.findall(s):
+        low = tok.lower()
+        if low in _MEXPR_ALLOWED_FUNCS:
+            continue
+        if tok in local_dict:
+            continue
+        return False
+    return True
+from security_validation import (
+    GPKG_UPLOAD_EXTENSIONS,
+    is_safe_relative_data_path,
+    is_safe_sql_identifier,
+    quote_sql_identifier,
+    sqlite_table_exists,
+    sqlite_table_column_names,
+    path_is_under,
+    is_safe_subprocess_layer_name,
+)
+
+_GPKG_UPLOAD_EXT = {f".{ext}" for ext in GPKG_UPLOAD_EXTENSIONS}
+
+logger = logging.getLogger(__name__)
 
 alias_mapping = {}
 global_dbs_tables_columns = {}
@@ -45,7 +86,9 @@ def fetch_data_service(data):
         )
         original_columns = columns if isinstance(columns, list) else []
         selected_ids = json.loads(data.get("id"))
-        id_column = data.get("id_column", "ID")
+        id_column = (data.get("id_column") or "ID").strip() or "ID"
+        if not is_safe_sql_identifier(id_column):
+            return {"error": "Invalid id column parameter."}
         start_date = data.get("start_date")
         end_date = data.get("end_date")
         date_type = data.get("date_type")
@@ -160,8 +203,11 @@ def fetch_data_service(data):
                     df = pd.merge(df, df_temp, on=merge_on_columns, how="outer")
                     # Drop rows with NaN in the required columns
                     df.dropna(inplace=True, how="all")
-            except Exception as e:
-                return {"error": f"Error while processing table {table_key}: {str(e)}"}
+            except ValueError:
+                return {"error": "Invalid query parameters."}
+            except Exception:
+                logger.exception("fetch_data_service: table processing failed")
+                return {"error": "Error while processing data request."}
 
         # If the DataFrame is empty after merging, return an error
         if df.empty:
@@ -175,17 +221,21 @@ def fetch_data_service(data):
             conn = sqlite3.connect(bmp_db_path)
 
             try:
-                # Get the ID column name for Subarea table
-                query = f"PRAGMA table_info('Subarea')"
-                cursor = conn.cursor()
-                cursor.execute(query)
+                if not sqlite_table_exists(conn, "Subarea"):
+                    return {"error": "Subarea table is not available."}
+                sub_cols = sqlite_table_column_names(conn, "Subarea")
                 subarea_id = next(
-                    (col[1] for col in cursor.fetchall() if "id" in col[1].lower()),
+                    (c for c in sub_cols if "id" in c.lower()),
                     "ID",
                 )
-
+                if subarea_id not in sub_cols or not is_safe_sql_identifier(subarea_id):
+                    subarea_id = "ID"
+                if "FieldId" not in sub_cols or "Area" not in sub_cols:
+                    return {"error": "Subarea table is missing required columns."}
+                sid_q = quote_sql_identifier(subarea_id)
+                q_sub = quote_sql_identifier("Subarea")
                 # Read Subarea information (Id, FieldId, and Area) from the Subarea table
-                query = f"SELECT {subarea_id} AS '{ID}', FieldId, Area FROM Subarea"
+                query = f"SELECT {sid_q} AS {quote_sql_identifier(ID)}, {quote_sql_identifier('FieldId')}, {quote_sql_identifier('Area')} FROM {q_sub}"
                 params = []
 
                 # Add conditions for selected field IDs
@@ -346,17 +396,22 @@ def fetch_data_service(data):
                                 re.sub(f"[{re.escape(special_chars)}]", "", col_name)
                                 in col_formula
                             ):
-                                # Evaluate the formula and assign it to the new column
+                                cf = col_formula.strip()
+                                if not _numexpr_is_safe(cf, local_dict):
+                                    logger.warning("Rejected math_formula token(s)")
+                                    return {"error": "Request validation failed."}
                                 df[col_name] = ne.evaluate(
-                                    col_formula.strip(), local_dict=local_dict
+                                    cf, local_dict=local_dict
                                 )
                 else:
-                    # Evaluate the formula and assign it to the new column
-                    df[new_feature] = ne.evaluate(
-                        math_formula.strip(), local_dict=local_dict
-                    )
-            except Exception as e:
-                return {"error": f"Error evaluating formula: {str(e)}"}
+                    cf = math_formula.strip()
+                    if not _numexpr_is_safe(cf, local_dict):
+                        logger.warning("Rejected math_formula token(s)")
+                        return {"error": "Request validation failed."}
+                    df[new_feature] = ne.evaluate(cf, local_dict=local_dict)
+            except Exception:
+                logger.exception("math_formula evaluation failed")
+                return {"error": "Invalid or unsupported formula."}
 
         # Filter each df column for specific values from dict
         if "filter" in data:
@@ -443,8 +498,9 @@ def fetch_data_service(data):
             ),
             "statsColumns": stats_df.columns.tolist() if stats_df is not None else [],
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("fetch_data_service failed")
+        return {"error": "Unable to fetch data for the current request."}
 
 
 def export_data_service(data, is_empty=False):
@@ -515,62 +571,91 @@ def export_data_service(data, is_empty=False):
         )
 
         return {"file_path": file_path}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("export_data_service failed")
+        return {"error": "Export failed."}
 
 
 def fetch_data_from_db(
     db_path, table_name, selected_ids, columns, start_date, end_date, date_type
 ):
     """Fetch data from a SQLite database table with real-to-alias mapping."""
-    conn = sqlite3.connect(safe_join(Config.PATHFILE, db_path))
+    if not is_safe_relative_data_path(db_path):
+        raise ValueError("Invalid database path")
+    full_db = safe_join(Config.PATHFILE, db_path)
+    if not full_db or not path_is_under(Config.PATHFILE, full_db):
+        raise ValueError("Invalid database path")
 
-    # table_name is an alias so replace it with the real table name
-    real_table_name = alias_mapping.get(table_name, {}).get("real", table_name)
+    conn = sqlite3.connect(full_db)
+    try:
+        real_table_name = alias_mapping.get(table_name, {}).get("real", table_name)
+        if not is_safe_sql_identifier(real_table_name):
+            raise ValueError("Invalid table name")
+        if not sqlite_table_exists(conn, real_table_name):
+            raise ValueError("Invalid table name")
 
-    # If specific columns are selected, map them to the real columns
-    columns_list = []
-    if columns != "All":
-        columns_list = columns
-        real_columns = [
-            f'"{alias_mapping.get(table_name, {}).get("columns", {}).get(col, col)}"'
-            for col in columns_list
-        ]
-        columns = ",".join(real_columns)
-    else:
-        columns_list = pd.read_sql_query(
-            f"PRAGMA table_info('{real_table_name}')", conn
-        )["name"].tolist()
+        col_names = sqlite_table_column_names(conn, real_table_name)
+        if not col_names:
+            raise ValueError("Invalid table name")
 
-    # Start building the base query using real table name
-    query = f"SELECT {columns if columns != 'All' else '*'} FROM '{real_table_name}'"
-    params = []
+        q_table = quote_sql_identifier(real_table_name)
 
-    ID = next((col for col in columns_list if "ID" in col), "ID")
-
-    # Add conditions for selected_ids
-    if selected_ids != []:
-        placeholders = ",".join(["?"] * len(selected_ids))
-        query += f" WHERE {ID} IN ({placeholders})"
-        params.extend(selected_ids)
-
-    # Add date range conditions
-    if start_date and end_date:
-        if selected_ids != []:
-            query += f" AND {date_type} BETWEEN ? AND ?"
+        if columns != "All":
+            columns_list = list(columns)
+            real_col_names = []
+            for col in columns_list:
+                rc = str(
+                    alias_mapping.get(table_name, {}).get("columns", {}).get(col, col)
+                )
+                if not is_safe_sql_identifier(rc) or rc not in col_names:
+                    raise ValueError("Invalid column selection")
+                real_col_names.append(rc)
+            cols_sql = ",".join(quote_sql_identifier(c) for c in real_col_names)
         else:
-            query += f" WHERE {date_type} BETWEEN ? AND ?"
-        params.extend([start_date, end_date])
+            columns_list = sorted(col_names, key=str)
+            cols_sql = "*"
 
-    # Execute the query with parameters
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
+        id_real = None
+        id_alias = next((col for col in columns_list if "ID" in str(col)), None)
+        if id_alias is not None:
+            cand = str(
+                alias_mapping.get(table_name, {}).get("columns", {}).get(
+                    id_alias, id_alias
+                )
+            )
+            if cand in col_names and is_safe_sql_identifier(cand):
+                id_real = cand
+        if id_real is None:
+            id_real = next((c for c in col_names if "ID" in c), None)
+        if id_real is None or not is_safe_sql_identifier(id_real):
+            raise ValueError("Invalid ID column for query")
 
-    # Map real column names back to alias if needed
+        query = f"SELECT {cols_sql} FROM {q_table}"
+        params = []
+
+        if selected_ids:
+            placeholders = ",".join(["?"] * len(selected_ids))
+            query += f" WHERE {quote_sql_identifier(id_real)} IN ({placeholders})"
+            params.extend(selected_ids)
+
+        if start_date and end_date:
+            if date_type not in col_names or not is_safe_sql_identifier(date_type):
+                raise ValueError("Invalid date column for query")
+            dt_q = quote_sql_identifier(date_type)
+            if selected_ids:
+                query += f" AND {dt_q} BETWEEN ? AND ?"
+            else:
+                query += f" WHERE {dt_q} BETWEEN ? AND ?"
+            params.extend([start_date, end_date])
+
+        df = pd.read_sql_query(query, conn, params=params)
+    finally:
+        conn.close()
+
     alias_columns = [
         (
             alias_mapping.get(real_table_name, {}).get("columns", {}).get(col, col)
-            if ID not in col
+            if id_real not in col
             else col
         )
         for col in df.columns
@@ -603,15 +688,35 @@ def save_to_file(
     is_empty=False,
 ):
     """Save two DataFrames to the specified file format sequentially."""
-    # Set the file path
-    file_path = (
-        safe_join(Config.PATHFILE_EXPORT, export_path)
-        if not os.path.isabs(export_path) or os.environ.get("WAITRESS") == "1" or not is_running_as_pyinstaller()
-        else export_path
+    use_relative = (
+        not os.path.isabs(export_path)
+        or os.environ.get("WAITRESS") == "1"
+        or not is_running_as_pyinstaller()
     )
+    if use_relative:
+        if not is_safe_relative_data_path(export_path):
+            raise ValueError("Invalid export path")
+        base_dir = safe_join(Config.PATHFILE_EXPORT, export_path)
+        if not base_dir or not path_is_under(Config.PATHFILE_EXPORT, base_dir):
+            raise ValueError("Invalid export path")
+    else:
+        base_dir = export_path
 
-    os.makedirs(file_path, exist_ok=True)
-    file_path = safe_join(file_path, filename)
+    if (
+        not filename
+        or "/" in filename
+        or "\\" in filename
+        or ".." in filename
+        or "\x00" in filename
+    ):
+        raise ValueError("Invalid filename")
+
+    os.makedirs(base_dir, exist_ok=True)
+    file_path = safe_join(base_dir, filename)
+    if not file_path or (
+        use_relative and not path_is_under(Config.PATHFILE_EXPORT, file_path)
+    ):
+        raise ValueError("Invalid file path")
 
     # Map graph types to Matplotlib Axes methods
     GRAPH_TYPE_MAPPING = {
@@ -976,7 +1081,11 @@ def get_table_names(data):
     conn = None
     try:
         db_path = data.get("db_path")
+        if not db_path or not is_safe_relative_data_path(db_path):
+            return {"error": "Invalid database path."}
         full_path = safe_join(Config.PATHFILE, db_path)
+        if not full_path or not path_is_under(Config.PATHFILE, full_path):
+            return {"error": "Invalid database path."}
         tables = []
 
         # For regular SQLite (.db3)
@@ -1035,6 +1144,8 @@ def get_files_and_folders(data):
         # Update Config.PATHFILE to point to the parent directory of the provided absolute path
         Config.PATHFILE = os.path.dirname(folder_path)
         base_path = Config.PATHFILE
+        if not os.path.isdir(folder_path) or not path_is_under(base_path, folder_path):
+            return {"error": "Invalid folder path."}
     elif os.path.isabs(folder_path):
         return {
             "error": "The folder path cannot be absolute when not using the Tauri app."
@@ -1053,11 +1164,16 @@ def get_files_and_folders(data):
         # Construct the absolute folder path relative to the current file location
         folder_path = safe_join(base_path, folder_path)
 
+    if not folder_path or not path_is_under(base_path, folder_path):
+        return {"error": "Invalid folder path."}
+
     try:
         files_and_folders = []
         lookup_found = False
 
         for dirpath, dirs, files in os.walk(folder_path):
+            if not path_is_under(base_path, dirpath):
+                continue
             # Construct the relative path from the base folder
             rel_dir = os.path.relpath(dirpath, base_path)
 
@@ -1264,11 +1380,13 @@ def load_alias_mapping(folder_tree):
     alias_map = {}
 
     # Query the alias tables (Hydroclimate, BMP, scenario_2)
-    for table in folder_tree:
+    for table_path in folder_tree:
         # Extract the table name from the path
-        table = os.path.basename(table).replace(".db3", "")
+        table = os.path.basename(table_path).replace(".db3", "")
+        if not is_safe_sql_identifier(table) or not sqlite_table_exists(conn, table):
+            continue
 
-        query = f"SELECT * FROM '{table}'"
+        query = f"SELECT * FROM {quote_sql_identifier(table)}"
         df = pd.read_sql_query(query, conn)
 
         for _, row in df.iterrows():
@@ -1290,29 +1408,34 @@ def load_alias_mapping(folder_tree):
 def get_columns_and_time_range(db_path, table_name):
     """Fetch column names and time range from a SQLite database table with real-to-alias mapping."""
 
+    conn = None
     try:
-        # Convert the table alias to its real name if necessary
+        if not is_safe_relative_data_path(db_path):
+            return {"error": "Invalid database path."}
+        full_db = safe_join(Config.PATHFILE, db_path)
+        if not full_db or not path_is_under(Config.PATHFILE, full_db):
+            return {"error": "Invalid database path."}
+
         real_table_name = alias_mapping.get(table_name, {}).get("real", table_name)
+        if not is_safe_sql_identifier(real_table_name):
+            return {"error": "Invalid table name."}
 
-        # Connect to the database
-        conn = sqlite3.connect(safe_join(Config.PATHFILE, db_path))
+        conn = sqlite3.connect(full_db)
+        if not sqlite_table_exists(conn, real_table_name):
+            return {"error": "Invalid table name."}
 
-        # Fetch column information using PRAGMA for the real table name
-        query = f"PRAGMA table_info('{real_table_name}')"
-        cursor = conn.cursor()
-        cursor.execute(query)
-        columns = [row[1] for row in cursor.fetchall()]
+        columns = sorted(sqlite_table_column_names(conn, real_table_name))
+        if not columns:
+            return {"error": "Invalid table name."}
 
-        # Convert real column names to alias names (if available in the mapping)
         alias_columns = [
             alias_mapping.get(real_table_name, {}).get("columns", {}).get(col, col)
             for col in columns
         ]
 
-        # Initialize variables
         start_date = end_date = date_type = interval = None
+        q_table = quote_sql_identifier(real_table_name)
 
-        # Check and query for specific date/time columns (using real column names)
         for date_col, dtype, inter in [
             ("Time", "Time", "daily"),
             ("Date", "Date", "daily"),
@@ -1320,9 +1443,8 @@ def get_columns_and_time_range(db_path, table_name):
             ("Year", "Year", "yearly"),
         ]:
             if date_col in columns:
-                df = pd.read_sql_query(
-                    f"SELECT {date_col} FROM '{real_table_name}'", conn
-                )
+                dc_q = quote_sql_identifier(date_col)
+                df = pd.read_sql_query(f"SELECT {dc_q} FROM {q_table}", conn)
                 if date_col in ["Time", "Date"]:
                     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
                     start_date = df[date_col].min().strftime("%Y-%m-%d")
@@ -1334,15 +1456,15 @@ def get_columns_and_time_range(db_path, table_name):
                 interval = inter
                 break
 
-        # Get list of IDs if an ID column exists, without querying unnecessary data
         id_column = next((col for col in columns if "ID" in col), None)
         ids = []
-        if id_column:
-            id_query = f"SELECT DISTINCT {id_column} FROM '{real_table_name}'"
-            id_df = pd.read_sql_query(id_query, conn)
+        if id_column and is_safe_sql_identifier(id_column):
+            id_q = quote_sql_identifier(id_column)
+            id_df = pd.read_sql_query(
+                f"SELECT DISTINCT {id_q} FROM {q_table}", conn
+            )
             ids = id_df[id_column].tolist()
 
-        # Return alias column names instead of real ones
         return {
             "columns": alias_columns,
             "start_date": start_date,
@@ -1352,10 +1474,12 @@ def get_columns_and_time_range(db_path, table_name):
             "date_type": date_type,
             "interval": interval,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("get_columns_and_time_range failed")
+        return {"error": "Failed to read table metadata."}
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def get_multi_columns_and_time_range(data):
@@ -1854,9 +1978,20 @@ def process_geospatial_data(data):
     Process a geospatial file (shapefile or raster) and return GeoJSON/Tiff Image Url, bounds, and center.
     """
 
-    file_paths = map(
-        lambda x: safe_join(Config.PATHFILE, x), json.loads(data.get("file_paths"))
-    )
+    try:
+        raw_fp = json.loads(data.get("file_paths"))
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "Invalid file_paths parameter."}
+    if not isinstance(raw_fp, list):
+        return {"error": "Invalid file_paths parameter."}
+    file_paths = []
+    for x in raw_fp:
+        if not isinstance(x, str) or not is_safe_relative_data_path(x):
+            return {"error": "Invalid file path."}
+        p = safe_join(Config.PATHFILE, x)
+        if not p or not path_is_under(Config.PATHFILE, p):
+            return {"error": "Invalid file path."}
+        file_paths.append(p)
     layer_names_map = json.loads(data.get("layer_names", "{'GeoDB.gpkg': []}"))
     combined_geojson = {}
     combined_bounds = None
@@ -2208,14 +2343,31 @@ def export_map_service(image, form_data):
         output_format = form_data.get("export_format")
         output_path = form_data.get("export_path")
         output_filename = form_data.get("export_filename")
-        file_paths = map(
-            lambda x: safe_join(Config.PATHFILE, x),
-            json.loads(form_data.get("file_paths")),
-        )
+        try:
+            raw_fp = json.loads(form_data.get("file_paths"))
+        except (json.JSONDecodeError, TypeError):
+            return {"error": "Invalid file_paths parameter."}
+        if not isinstance(raw_fp, list):
+            return {"error": "Invalid file_paths parameter."}
+        file_paths = []
+        for x in raw_fp:
+            if not isinstance(x, str) or not is_safe_relative_data_path(x):
+                return {"error": "Invalid file path."}
+            p = safe_join(Config.PATHFILE, x)
+            if not p or not path_is_under(Config.PATHFILE, p):
+                return {"error": "Invalid file path."}
+            file_paths.append(p)
 
+        if not is_safe_relative_data_path(output_path):
+            return {"error": "Invalid export path."}
         export_dir = safe_join(Config.PATHFILE_EXPORT, output_path)
+        if not export_dir or not path_is_under(Config.PATHFILE_EXPORT, export_dir):
+            return {"error": "Invalid export path."}
         os.makedirs(export_dir, exist_ok=True)
-        image_path = os.path.join(export_dir, f"{output_filename}.{output_format}")
+        safe_name = os.path.basename(output_filename)
+        if not safe_name or "/" in output_filename or "\\" in output_filename:
+            return {"error": "Invalid export filename."}
+        image_path = os.path.join(export_dir, f"{safe_name}.{output_format}")
 
         # Export image formats
         if image:
@@ -2273,9 +2425,11 @@ def export_map_service(image, form_data):
             )
 
             # Save plot
-            file_name = os.path.basename(file_path).split(".")[0]
+            file_name = secure_filename(os.path.basename(file_path).split(".")[0])
+            if not file_name:
+                file_name = "layer"
             image_path = os.path.join(
-                export_dir, f"{output_filename}_{file_name}.{output_format}"
+                export_dir, f"{safe_name}_{file_name}.{output_format}"
             )
             plt.savefig(image_path, dpi=300, format=output_format)
             plt.close(fig)
@@ -2283,14 +2437,27 @@ def export_map_service(image, form_data):
             exported_images.append(image_path)
 
         # Combine exported images into a single zip file
-        zip_path = os.path.join(export_dir, f"{output_filename}.zip")
+        zip_path = os.path.join(export_dir, f"{safe_name}.zip")
         with ZipFile(zip_path, "w") as zipf:
             for image_path in exported_images:
                 zipf.write(image_path, os.path.basename(image_path))
 
         return {"file_path": zip_path}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("export_map_service failed")
+        return {"error": "Map export failed."}
+
+
+def _normalized_excel_stored_name(filename: str) -> str:
+    b = os.path.basename((filename or "").replace("\\", "/"))
+    stem, ext = os.path.splitext(b)
+    ext = ext.lower()
+    if ext not in (".xlsx", ".xls"):
+        return ""
+    stem_s = secure_filename(stem)
+    if not stem_s:
+        return ""
+    return stem_s + ext
 
 
 def convert_excels_to_db_service(excel_files, data):
@@ -2318,14 +2485,19 @@ def convert_excels_to_db_service(excel_files, data):
         header_mapping = json.loads(header_mapping)
         merged_mapping = json.loads(merged_mapping)
 
-        # Save all uploaded Excel files temporarily
-        for file in excel_files:
-            filename = file.filename
-            path = os.path.join(Config.TEMPDIR, filename)
-            file.save(path)
-            saved_files[filename] = path
+        for db_name in mapping:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}\.db3", db_name):
+                return {"error": "Invalid mapping configuration."}
 
-        # Track used sheets per file
+        # Save all uploaded Excel files temporarily (names normalized; no path traversal)
+        for file in excel_files:
+            fn = _normalized_excel_stored_name(file.filename)
+            if not fn:
+                return {"error": "Invalid Excel file name."}
+            path = os.path.join(Config.TEMPDIR, fn)
+            file.save(path)
+            saved_files[fn] = path
+
         for filename in saved_files:
             used_sheets[filename] = set()
 
@@ -2342,9 +2514,11 @@ def convert_excels_to_db_service(excel_files, data):
             current_year = None
 
             def safe_append_to_sql(df, table_name, conn, if_exists="append"):
+                if not is_safe_sql_identifier(str(table_name)):
+                    return
                 # Get existing table column names
                 existing_cols = pd.read_sql(
-                    f"SELECT * FROM '{table_name}' LIMIT 0", conn
+                    f"SELECT * FROM {quote_sql_identifier(table_name)} LIMIT 0", conn
                 ).columns.tolist()
 
                 # Add missing columns to DataFrame with NaN values
@@ -2356,14 +2530,15 @@ def convert_excels_to_db_service(excel_files, data):
                 df.to_sql(table_name, conn, if_exists=if_exists, index=False)
 
             for excel_filename, sheet_list in file_sheet_map.items():
-                if excel_filename not in saved_files:
+                nk = _normalized_excel_stored_name(excel_filename)
+                if nk not in saved_files:
                     continue
 
-                excel_path = saved_files[excel_filename]
+                excel_path = saved_files[nk]
                 excel_data = pd.ExcelFile(excel_path)
                 all_sheets = set(excel_data.sheet_names)
                 # Find year from filename, "data_2023-2024.xlsx" or "data_2023-12.xlsx"
-                match = re.findall(r"\d{4}-\d{4}|\d{4}-\d{2}", excel_filename)
+                match = re.findall(r"\d{4}-\d{4}|\d{4}-\d{2}", nk)
                 if match:
                     year_range = match[0]
 
@@ -2384,7 +2559,7 @@ def convert_excels_to_db_service(excel_files, data):
                 target_sheets = (
                     set(sheet_list)
                     if sheet_list
-                    else all_sheets - used_sheets[excel_filename]
+                    else all_sheets - used_sheets[nk]
                 )
 
                 for sheet_name in target_sheets:
@@ -2437,7 +2612,7 @@ def convert_excels_to_db_service(excel_files, data):
                             df[col] = df[col].ffill()
 
                     # Determine metadata
-                    excel_filename_org = os.path.splitext(excel_filename)[0]
+                    excel_filename_org = os.path.splitext(nk)[0]
                     excel_filename_id = (
                         excel_filename_org.split("_")[0].strip().replace(" ", "_")
                     )
@@ -2454,7 +2629,7 @@ def convert_excels_to_db_service(excel_files, data):
                         else current_year
                     )
                     df["Organization"] = organization
-                    df["Source_File"] = excel_filename
+                    df["Source_File"] = nk
                     df["Source_Sheet"] = sheet_name
 
                     df.replace(
@@ -2566,7 +2741,7 @@ def convert_excels_to_db_service(excel_files, data):
                             )
 
                     # Mark sheet as used
-                    used_sheets[excel_filename].add(sheet_name)
+                    used_sheets[nk].add(sheet_name)
 
             # If BMP, save the final DataFrame to the database
             if "BMP" in db_name and not df_final.empty:
@@ -2607,6 +2782,8 @@ def convert_excels_to_db_service(excel_files, data):
             if "BMP" in db_name:
                 continue
             for table_name, df in combined_dfs.items():
+                if not is_safe_sql_identifier(str(table_name)):
+                    continue
                 df.dropna(how="all", inplace=True)
                 df.replace([r"^\s*$", r"(?i)^nan$"], np.nan, regex=True, inplace=True)
                 if conflict_action == "replace":
@@ -2624,8 +2801,9 @@ def convert_excels_to_db_service(excel_files, data):
 
         return results
 
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("convert_excels_to_db_service failed")
+        return {"error": "Excel conversion failed."}
 
 
 def convert_to_gpkg_service(uploaded_files):
@@ -2641,28 +2819,37 @@ def convert_to_gpkg_service(uploaded_files):
         except Exception:
             continue
 
-    # Save all files to Config.TEMPDIR
+    base_names = set()
     for file in uploaded_files:
-        file_path = os.path.join(Config.TEMPDIR, file.filename)
+        raw = file.filename or ""
+        stem, ext = os.path.splitext(raw)
+        ext = ext.lower()
+        if ext not in _GPKG_UPLOAD_EXT:
+            return {"error": "Unsupported file type."}
+        stem_safe = secure_filename(stem)
+        if not stem_safe or not is_safe_subprocess_layer_name(stem_safe):
+            return {"error": "Invalid file name."}
+        file_path = os.path.join(Config.TEMPDIR, stem_safe + ext)
         file.save(file_path)
-
-    # Group files by basename for shapefile components
-    base_names = set(os.path.splitext(f.filename)[0] for f in uploaded_files)
+        base_names.add(stem_safe)
 
     output_gpkg = os.path.join(Config.BASE_DIR, "Geospatial/GeoDB.gpkg")
     first_layer_created = os.path.exists(output_gpkg)
 
     def delete_layer_if_exists(gpkg_path, layer_name):
-        # Check if layer exists
+        if not is_safe_subprocess_layer_name(layer_name):
+            return
         result = subprocess.run(
             ["ogrinfo", gpkg_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            check=False,
         )
         if layer_name in result.stdout:
             subprocess.run(
-                ["ogrinfo", gpkg_path, "-sql", f'DROP TABLE "{layer_name}"'], check=True
+                ["ogrinfo", gpkg_path, "-sql", f'DROP TABLE "{layer_name}"'],
+                check=True,
             )
 
     try:
@@ -2731,5 +2918,6 @@ def convert_to_gpkg_service(uploaded_files):
 
         return output_gpkg
 
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("convert_to_gpkg_service failed")
+        return {"error": "GeoPackage conversion failed."}

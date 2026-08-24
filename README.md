@@ -31,11 +31,14 @@
       <ul>
         <li><a href="#-installation">Installation</a></li>
         <li><a href="#-backend-admin-authentication-flask">Backend admin authentication (Flask)</a></li>
+        <li><a href="#web-and-cloud-deployment">Web and Cloud Deployment</a></li>
       </ul>
     </li>
     <li><a href="#%EF%B8%8F-common-issues">Common Issues</a></li>
     <li><a href="#-freeing-up-space-after-uninstalling">Freeing Up Space After Uninstalling</a></li>
     <li><a href="#-technical-report">Technical Report</a></li>
+    <li><a href="#security">Security</a></li>
+    <li><a href="#contributors">Contributors</a></li>
     <li><a href="#-acknowledgments">Acknowledgments</a></li>
   </ol>
 </details>
@@ -53,9 +56,10 @@ Built with **Tauri**, **Vue 3**, and **Flask**, this application provides a rich
 - **Cross-Platform Support:** Packages available for Windows, macOS, and Linux.
 - **Dynamic Visualization:** Interactive charts using ECharts and maps using Leaflet.
 - **Geospatial Intelligence:** Support for shapefiles, GeoTIFFs, and export to SHP and GeoJSON.
-- **Custom Formula Builder:** Combine numerical columns using mathematical expressions.
+- **Custom Formula Builder:** Combine numerical columns using mathematical expressions, evaluated through a sandboxed expression engine (no `eval`/`exec` on user input).
 - **Data Export:** Export tables, graphs, and maps to multiple formats (CSV, TXT, XLSX, PNG, SVG, PDF, SHP).
-- **Authentication Support:** Login/logout with JWT-based token security (web mode).
+- **Authentication Support:** Login/logout with JWT-based token security, bcrypt-hashed credentials (no plaintext passwords or default fallbacks), and enforced password complexity at account creation. See [Security](#security).
+- **Hardened Input Handling:** Parameterized SQL, SQL-identifier allowlisting, and path-traversal guards across every API route that touches the filesystem or a database.
 - **Integrated Build Pipeline:** Docker, Makefile, and PowerShell scripts included for CI/CD and version control.
 
 ---
@@ -174,6 +178,8 @@ Copy `backend/.env.example` to `backend/.env` before first run, or use the helpe
 
 3. Enter usernames and passwords when prompted. Passwords are hashed with bcrypt and written to `backend/.env`. `create_admin.py` also generates `JWT_SECRET_KEY` if it is not already set.
 
+   **Password requirements:** at least 12 characters, and at least 3 of the following character classes: lowercase letter, uppercase letter, digit, symbol. The script rejects weaker passwords and exits without writing to `.env`.
+
 **Generate a bcrypt hash manually**
 
 If you prefer not to use the script, you can generate a hash in Python (from `backend` with dependencies installed):
@@ -203,6 +209,16 @@ docker run -p 0.0.0.0:5000:5000 --env-file backend/.env nutriview
 ```
 
 `--env-file` injects variables into the container process. The Flask app does not read any other env file name (there is no separate root-level `backend.env`); `load_dotenv` only loads `backend/.env` when variables are not already set.
+
+### Web and Cloud Deployment
+
+If you're running the Flask backend as a web service rather than behind the desktop app (Docker, `PRODUCTION=True`, or any hosted deployment), set `CORS_ALLOWED_ORIGINS` in `backend/.env` to your frontend's real origin(s), comma-separated:
+
+```env
+CORS_ALLOWED_ORIGINS="https://your-frontend-domain.com"
+```
+
+Without this set, CORS defaults to local development (`http://localhost:1420`) and the Tauri desktop webview origins only — a hosted web frontend on any other origin will have its API requests rejected by the browser until this is configured.
 
 ## Common Issues
 
@@ -256,6 +272,23 @@ rm -rf ~/Library/Application\ Support/Nutri-View/TempFiles
 For a detailed explanation of the application's architecture, data processing workflows, and design decisions, please refer to the full technical report:
 
 [Download the Nutri-View Technical Report (.docx)](https://github.com/shahviransh/Nutri-View/raw/refs/heads/main/Technical%20Report.docx)
+
+## Security
+
+Nutri-View has been through a security assessment covering credential handling, input validation, cross-platform packaging, and multi-user/cloud deployment concerns. Highlights:
+
+- **No default or hardcoded credentials.** The backend refuses to start unless `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `GUEST_USERNAME`, and `GUEST_PASSWORD` are all set — see [Backend admin authentication](#-backend-admin-authentication-flask).
+- **Passwords are bcrypt-hashed and complexity-checked** at creation time (see above); plaintext passwords are never stored or documented.
+- **Input validation** on every API route: parameterized SQL, SQL-identifier allowlisting, path-traversal guards on all file operations, and a sandboxed (non-`eval`) formula evaluator for the custom formula builder.
+- **CORS is restricted to an explicit allow-list** rather than open to any origin — see [Web and Cloud Deployment](#web-and-cloud-deployment).
+
+**Known open gaps** (tracked, not yet resolved): no external identity-provider (e.g. Entra ID) integration, no per-person user identifiers (only shared `admin`/`guest` roles), no password expiry/rotation policy, and several places where the app's original single-user/desktop design assumptions don't yet hold up under concurrent multi-user or cloud deployment (shared global state, a shared temp-file directory without per-user ownership checks, and an in-memory session-revocation list that won't work across multiple server instances).
+
+Full findings, evidence, and a prioritized remediation plan: **[SECURITY_ASSESSMENT.md](./SECURITY_ASSESSMENT.md)**.
+
+## Contributors
+
+- **Apurva Agrawal** — Lead Developer ([@Apurva-3003](https://github.com/Apurva-3003))
 
 ## Acknowledgments
 

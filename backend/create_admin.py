@@ -16,7 +16,12 @@ from pathlib import Path
 
 import bcrypt
 
-from credential_utils import read_env_lines, strip_env_keys, write_env_lines
+from credential_utils import (
+    password_complexity_error,
+    read_env_lines,
+    strip_env_keys,
+    write_env_lines,
+)
 
 _ADMIN_KEYS = frozenset({"ADMIN_USERNAME", "ADMIN_PASSWORD_HASH"})
 _JWT_KEY = "JWT_SECRET_KEY"
@@ -49,6 +54,11 @@ def main() -> int:
         return 1
     if not password:
         print("Error: password cannot be empty.", file=sys.stderr)
+        return 1
+
+    complexity_error = password_complexity_error(password)
+    if complexity_error:
+        print(f"Error: {complexity_error}", file=sys.stderr)
         return 1
 
     password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode(

@@ -14,20 +14,26 @@ async fn start_server() {
     let exe_dir = current_exe.parent().expect("Failed to get parent directory");
     let backend_dir = exe_dir.join("_up_");
 
-    // Fetch the target triple using the environment variables or a fallback
-    let target_triple = format!(
-        "{}-{}-{}-{}",
-        std::env::consts::ARCH,
-        "pc",
-        std::env::consts::OS,
-        if cfg!(target_env = "gnu") {
-            "gnu"
-        } else if cfg!(target_env = "msvc") {
-            "msvc"
-        } else {
-            "unknown"
-        }
-    );
+    // Fetch the target triple to match the sidecar filename produced by move.js
+    // (via `rustc -vV`'s host triple). macOS uses "{arch}-apple-darwin", which
+    // doesn't fit the "{arch}-pc-{os}-{env}" pattern used by Windows/Linux.
+    let target_triple = if cfg!(target_os = "macos") {
+        format!("{}-apple-darwin", std::env::consts::ARCH)
+    } else {
+        format!(
+            "{}-{}-{}-{}",
+            std::env::consts::ARCH,
+            "pc",
+            std::env::consts::OS,
+            if cfg!(target_env = "gnu") {
+                "gnu"
+            } else if cfg!(target_env = "msvc") {
+                "msvc"
+            } else {
+                "unknown"
+            }
+        )
+    };
     // Determine the server path using the fetched target triple
     let extension = if cfg!(target_os = "windows") { ".exe" } else { "" };
     let server_path = backend_dir

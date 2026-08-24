@@ -6,21 +6,6 @@
     "main"
   ],
   "permissions": [
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        {
-          "name": "exec-sh",
-          "cmd": "sh",
-          "args": [
-            "-c",
-            {
-              "validator": "\\S+"
-            }
-          ]
-        }
-      ]
-    },
     "dialog:default",
     "core:path:allow-dirname"
   ]

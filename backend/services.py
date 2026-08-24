@@ -473,11 +473,12 @@ def fetch_data_service(data):
                     ]
 
         def replace_nan_with_none(records):
+            # pd.api.types.is_scalar excludes list/dict/tuple/ndarray so pd.isna()
+            # never has to evaluate an array-like truthiness; scalar check also
+            # catches np.nan, pd.NA, and pd.NaT, not just plain float/int NaN.
             for record in records:
                 for key, value in record.items():
-                    if (
-                        isinstance(value, float) or isinstance(value, int)
-                    ) and np.isnan(value):
+                    if pd.api.types.is_scalar(value) and pd.isna(value):
                         record[key] = None
             return records
 

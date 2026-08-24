@@ -20,7 +20,16 @@ if os.path.exists(Config.TEMPDIR):
 os.makedirs(Config.TEMPDIR, exist_ok=True)
 
 app = Flask(__name__)
-CORS(app)
+
+# Comma-separated list of allowed origins, e.g. "https://app.example.com,https://admin.example.com".
+# Defaults cover local dev (Vite) and the Tauri desktop webview; override for web/cloud deployments.
+_DEFAULT_CORS_ORIGINS = "http://localhost:1420,tauri://localhost,http://tauri.localhost"
+_CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", _DEFAULT_CORS_ORIGINS).split(",")
+    if origin.strip()
+]
+CORS(app, origins=_CORS_ALLOWED_ORIGINS)
 
 # Configure caching
 cache = Cache(app, config={"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 300})

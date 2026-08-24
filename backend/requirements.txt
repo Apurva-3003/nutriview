@@ -81,7 +81,7 @@ python-dotenv
 python-engineio
 python-socketio
 pytz 
-pywin32-ctypes
+pywin32-ctypes; sys_platform == 'win32'
 PyYAML
 repoze.lru
 requests 
@@ -105,7 +105,7 @@ wcwidth
 webencodings
 Werkzeug
 wheel
-win_inet_pton 
+win_inet_pton; sys_platform == 'win32'
 wsproto
 XlsxWriter
 xyzservices 
